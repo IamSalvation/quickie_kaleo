@@ -7,8 +7,6 @@ import type {
     IcePayload,
 } from "../types";
 
-// In dev, Vite proxies /socket.io → localhost:3000 (see vite.config.ts).
-// In prod, the client talks directly to the Render-hosted signaling server.
 const SIGNAL_URL =
     import.meta.env.VITE_SIGNAL_URL ??
     (import.meta.env.PROD
@@ -17,10 +15,8 @@ const SIGNAL_URL =
 
 const ICE_CONFIG: RTCConfiguration = {
     iceServers: [
-        // Public STUN servers (fast path when direct connection works)
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun.relay.metered.ca:80" },
-        // Metered.ca TURN relay (fallback for CGNAT / strict NAT)
         {
             urls: "turn:global.relay.metered.ca:80",
             username: "37c57fb8f7f7b17037d93382",
@@ -61,14 +57,21 @@ export function useCall(myId: string | null) {
 
     // ---------- Cleanup ----------
     const cleanup = useCallback(() => {
-        pcRef.current?.close();
+        console.log("[Kaleo] cleanup()");
+
+        if (pcRef.current) {
+            pcRef.current.ontrack = null;
+            pcRef.current.onicecandidate = null;
+            pcRef.current.onconnectionstatechange = null;
+            pcRef.current.oniceconnectionstatechange = null;
+            pcRef.current.close();
+        }
         pcRef.current = null;
 
         localStreamRef.current?.getTracks().forEach((t) => t.stop());
         localStreamRef.current = null;
 
         pendingCandidatesRef.current = [];
-
         remoteIdRef.current = null;
         setLocalStream(null);
         setRemoteStream(null);
@@ -82,32 +85,61 @@ export function useCall(myId: string | null) {
     useEffect(() => {
         if (!myId) return;
 
-        const socket = io(SIGNAL_URL);
+        console.log("[Kaleo] connecting socket to", SIGNAL_URL);
+        const socket = io(SIGNAL_URL, {
+            transports: ["websocket", "polling"],
+            reconnection: true,
+            reconnectionAttempts: Infinity,
+            reconnectionDelay: 500,
+            reconnectionDelayMax: 3000,
+        });
         socketRef.current = socket;
 
-        socket.emit("register", myId);
+        // ✅ Re-register on EVERY connect (initial + auto-reconnects)
+        socket.on("connect", () => {
+            console.log("[Kaleo] socket connected:", socket.id);
+            socket.emit("register", myId);
+        });
+
+        socket.on("disconnect", (reason) => {
+            console.log("[Kaleo] socket disconnected:", reason);
+        });
+
+        socket.on("connect_error", (err) => {
+            console.error("[Kaleo] socket connect_error:", err.message);
+        });
 
         socket.on("incoming-call", (payload: IncomingCall) => {
+            console.log("[Kaleo] incoming-call from", payload.from);
             remoteIdRef.current = payload.from;
             setIncoming(payload);
             setState("ringing");
         });
 
         socket.on("call-answered", async ({ answer }: AnswerPayload) => {
+            console.log("[Kaleo] call-answered received");
             try {
-                await pcRef.current?.setRemoteDescription(answer);
-                // Flush any candidates that arrived before remote description
+                if (!pcRef.current) {
+                    console.error("[Kaleo] no pc when answer arrived!");
+                    return;
+                }
+                await pcRef.current.setRemoteDescription(answer);
+                console.log(
+                    "[Kaleo] flushing",
+                    pendingCandidatesRef.current.length,
+                    "queued candidates"
+                );
                 for (const c of pendingCandidatesRef.current) {
                     try {
-                        await pcRef.current?.addIceCandidate(c);
-                    } catch {
-                        /* ignore */
+                        await pcRef.current.addIceCandidate(c);
+                    } catch (err) {
+                        console.warn("[Kaleo] addIceCandidate failed:", err);
                     }
                 }
                 pendingCandidatesRef.current = [];
                 setState("connected");
             } catch (err) {
-                console.error("setRemoteDescription(answer) failed:", err);
+                console.error("[Kaleo] setRemoteDescription(answer) failed:", err);
             }
         });
 
@@ -118,12 +150,15 @@ export function useCall(myId: string | null) {
                 } else {
                     pendingCandidatesRef.current.push(candidate);
                 }
-            } catch {
-                /* ignore late/duplicate candidates */
+            } catch (err) {
+                console.warn("[Kaleo] ice-candidate error:", err);
             }
         });
 
-        socket.on("call-ended", () => cleanup());
+        socket.on("call-ended", () => {
+            console.log("[Kaleo] call-ended received");
+            cleanup();
+        });
 
         return () => {
             socket.disconnect();
@@ -133,30 +168,43 @@ export function useCall(myId: string | null) {
 
     // ---------- Media capture ----------
     const getMedia = useCallback(async (video: boolean) => {
-        const stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true,
-            },
-            video: video
-                ? { width: 640, height: 360, frameRate: 24 } // low start = data saver
-                : false,
-        });
-        localStreamRef.current = stream;
-        setLocalStream(stream);
-        return stream;
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                },
+                video: video
+                    ? { width: 640, height: 360, frameRate: 24 }
+                    : false,
+            });
+            localStreamRef.current = stream;
+            setLocalStream(stream);
+            return stream;
+        } catch (err) {
+            const e = err as Error;
+            console.error("[Kaleo] getMedia failed:", e.name, e.message);
+            alert(
+                `Kaleo can't access your ${video ? "camera and microphone" : "microphone"
+                }.\n\nError: ${e.name}\n\n` +
+                `On a device without a mic or camera, calls can't be made.`
+            );
+            throw err;
+        }
     }, []);
 
     // ---------- Peer connection ----------
     const createPeer = useCallback(
         (remoteId: string, stream: MediaStream) => {
+            console.log("[Kaleo] creating new RTCPeerConnection");
             const pc = new RTCPeerConnection(ICE_CONFIG);
             pcRef.current = pc;
 
             stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
             pc.ontrack = (e) => {
+                console.log("[Kaleo] remote track received:", e.track.kind);
                 setRemoteStream(e.streams[0]);
             };
 
@@ -166,6 +214,8 @@ export function useCall(myId: string | null) {
                         to: remoteId,
                         candidate: e.candidate,
                     });
+                } else {
+                    console.log("[Kaleo] ICE gathering complete");
                 }
             };
 
@@ -182,7 +232,6 @@ export function useCall(myId: string | null) {
                 console.log("[Kaleo] ICE state:", pc.iceConnectionState);
             };
 
-            // Prefer AV1 / VP9 for data savings (only matters if video)
             const caps = RTCRtpSender.getCapabilities("video");
             if (caps) {
                 const efficient = caps.codecs.filter((c) =>
@@ -204,11 +253,18 @@ export function useCall(myId: string | null) {
     const startCall = useCallback(
         async (remoteId: string, video: boolean) => {
             if (!myId) return;
+            console.log("[Kaleo] startCall →", remoteId, "video:", video);
+
+            // Clear any stale candidates from previous calls
+            pendingCandidatesRef.current = [];
+
             const stream = await getMedia(video);
             const pc = createPeer(remoteId, stream);
             const offer = await pc.createOffer();
             await pc.setLocalDescription(offer);
             remoteIdRef.current = remoteId;
+
+            console.log("[Kaleo] emitting call-user");
             socketRef.current?.emit("call-user", {
                 from: myId,
                 to: remoteId,
@@ -223,18 +279,24 @@ export function useCall(myId: string | null) {
     // ---------- Accept incoming ----------
     const acceptCall = useCallback(async () => {
         if (!incoming) return;
+        console.log("[Kaleo] acceptCall from", incoming.from);
+
+        // Clear any stale candidates
+        pendingCandidatesRef.current = [];
+
         const stream = await getMedia(incoming.video);
         const pc = createPeer(incoming.from, stream);
         await pc.setRemoteDescription(incoming.offer);
-        // Flush any candidates that arrived before remote description
+
         for (const c of pendingCandidatesRef.current) {
             try {
                 await pc.addIceCandidate(c);
-            } catch {
-                /* ignore */
+            } catch (err) {
+                console.warn("[Kaleo] addIceCandidate failed:", err);
             }
         }
         pendingCandidatesRef.current = [];
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socketRef.current?.emit("answer-call", {
@@ -247,6 +309,7 @@ export function useCall(myId: string | null) {
 
     // ---------- Decline incoming ----------
     const declineCall = useCallback(() => {
+        console.log("[Kaleo] declineCall");
         if (incoming) {
             socketRef.current?.emit("end-call", { to: incoming.from });
         }
@@ -270,13 +333,14 @@ export function useCall(myId: string | null) {
 
     // ---------- Hang up ----------
     const hangup = useCallback(() => {
+        console.log("[Kaleo] hangup");
         if (remoteIdRef.current) {
             socketRef.current?.emit("end-call", { to: remoteIdRef.current });
         }
         cleanup();
     }, [cleanup]);
 
-    // ---------- Data saver: pause outgoing video when tab hidden ----------
+    // ---------- Data saver ----------
     useEffect(() => {
         const onVis = () => {
             localStreamRef.current?.getVideoTracks().forEach((t) => {
