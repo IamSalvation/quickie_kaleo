@@ -17,10 +17,32 @@ const SIGNAL_URL =
 
 const ICE_CONFIG: RTCConfiguration = {
     iceServers: [
+        // Public STUN servers (fast path when direct connection works)
         { urls: "stun:stun.l.google.com:19302" },
-        // TURN for production (add when you have users on strict NATs):
-        // { urls: "turn:YOUR_TURN", username: "u", credential: "p" },
+        { urls: "stun:stun.relay.metered.ca:80" },
+        // Metered.ca TURN relay (fallback for CGNAT / strict NAT)
+        {
+            urls: "turn:global.relay.metered.ca:80",
+            username: "37c57fb8f7f7b17037d93382",
+            credential: "XnV0QcW3yIYC7vxo",
+        },
+        {
+            urls: "turn:global.relay.metered.ca:80?transport=tcp",
+            username: "37c57fb8f7f7b17037d93382",
+            credential: "XnV0QcW3yIYC7vxo",
+        },
+        {
+            urls: "turn:global.relay.metered.ca:443",
+            username: "37c57fb8f7f7b17037d93382",
+            credential: "XnV0QcW3yIYC7vxo",
+        },
+        {
+            urls: "turns:global.relay.metered.ca:443?transport=tcp",
+            username: "37c57fb8f7f7b17037d93382",
+            credential: "XnV0QcW3yIYC7vxo",
+        },
     ],
+    iceCandidatePoolSize: 10,
 };
 
 export function useCall(myId: string | null) {
@@ -28,6 +50,7 @@ export function useCall(myId: string | null) {
     const pcRef = useRef<RTCPeerConnection | null>(null);
     const localStreamRef = useRef<MediaStream | null>(null);
     const remoteIdRef = useRef<string | null>(null);
+    const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
 
     const [state, setState] = useState<CallState>("idle");
     const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -43,6 +66,8 @@ export function useCall(myId: string | null) {
 
         localStreamRef.current?.getTracks().forEach((t) => t.stop());
         localStreamRef.current = null;
+
+        pendingCandidatesRef.current = [];
 
         remoteIdRef.current = null;
         setLocalStream(null);
@@ -71,6 +96,15 @@ export function useCall(myId: string | null) {
         socket.on("call-answered", async ({ answer }: AnswerPayload) => {
             try {
                 await pcRef.current?.setRemoteDescription(answer);
+                // Flush any candidates that arrived before remote description
+                for (const c of pendingCandidatesRef.current) {
+                    try {
+                        await pcRef.current?.addIceCandidate(c);
+                    } catch {
+                        /* ignore */
+                    }
+                }
+                pendingCandidatesRef.current = [];
                 setState("connected");
             } catch (err) {
                 console.error("setRemoteDescription(answer) failed:", err);
@@ -79,7 +113,11 @@ export function useCall(myId: string | null) {
 
         socket.on("ice-candidate", async ({ candidate }: IcePayload) => {
             try {
-                await pcRef.current?.addIceCandidate(candidate);
+                if (pcRef.current?.remoteDescription) {
+                    await pcRef.current.addIceCandidate(candidate);
+                } else {
+                    pendingCandidatesRef.current.push(candidate);
+                }
             } catch {
                 /* ignore late/duplicate candidates */
             }
@@ -132,11 +170,16 @@ export function useCall(myId: string | null) {
             };
 
             pc.onconnectionstatechange = () => {
+                console.log("[Kaleo] connection state:", pc.connectionState);
                 if (
                     ["failed", "disconnected", "closed"].includes(pc.connectionState)
                 ) {
                     cleanup();
                 }
+            };
+
+            pc.oniceconnectionstatechange = () => {
+                console.log("[Kaleo] ICE state:", pc.iceConnectionState);
             };
 
             // Prefer AV1 / VP9 for data savings (only matters if video)
@@ -170,7 +213,7 @@ export function useCall(myId: string | null) {
                 from: myId,
                 to: remoteId,
                 offer,
-                video, // tell the other side whether to grab a camera
+                video,
             });
             setState("calling");
         },
@@ -183,6 +226,15 @@ export function useCall(myId: string | null) {
         const stream = await getMedia(incoming.video);
         const pc = createPeer(incoming.from, stream);
         await pc.setRemoteDescription(incoming.offer);
+        // Flush any candidates that arrived before remote description
+        for (const c of pendingCandidatesRef.current) {
+            try {
+                await pc.addIceCandidate(c);
+            } catch {
+                /* ignore */
+            }
+        }
+        pendingCandidatesRef.current = [];
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socketRef.current?.emit("answer-call", {
