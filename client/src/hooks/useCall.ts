@@ -7,18 +7,18 @@ import type {
     IcePayload,
 } from "../types";
 
-// In dev, Vite proxies /socket.io → localhost:3000 (see vite.config.ts)
-// In prod, the same server serves both the app and signaling
+// In dev, Vite proxies /socket.io → localhost:3000 (see vite.config.ts).
+// In prod, the client talks directly to the Render-hosted signaling server.
 const SIGNAL_URL =
     import.meta.env.VITE_SIGNAL_URL ??
     (import.meta.env.PROD
-        ? "https://n9f2t2xmdvzj-production-5kpawjol.europe-west1.suga.run"
+        ? "https://kaleo-signaling.onrender.com"
         : window.location.origin);
 
 const ICE_CONFIG: RTCConfiguration = {
     iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
-        // TURN for production:
+        // TURN for production (add when you have users on strict NATs):
         // { urls: "turn:YOUR_TURN", username: "u", credential: "p" },
     ],
 };
@@ -170,7 +170,7 @@ export function useCall(myId: string | null) {
                 from: myId,
                 to: remoteId,
                 offer,
-                video, // ← tell the other side whether to grab a camera
+                video, // tell the other side whether to grab a camera
             });
             setState("calling");
         },
@@ -178,7 +178,6 @@ export function useCall(myId: string | null) {
     );
 
     // ---------- Accept incoming ----------
-    // No more `video` parameter — we use whatever the caller requested.
     const acceptCall = useCallback(async () => {
         if (!incoming) return;
         const stream = await getMedia(incoming.video);
