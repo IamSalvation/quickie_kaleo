@@ -10,7 +10,10 @@ import type {
 // In dev, Vite proxies /socket.io → localhost:3000 (see vite.config.ts)
 // In prod, the same server serves both the app and signaling
 const SIGNAL_URL =
-    import.meta.env.VITE_SIGNAL_URL ?? window.location.origin;
+    import.meta.env.VITE_SIGNAL_URL ??
+    (import.meta.env.PROD
+        ? "https://n9f2t2xmdvzj-production-5kpawjol.europe-west1.suga.run"
+        : window.location.origin);
 
 const ICE_CONFIG: RTCConfiguration = {
     iceServers: [
