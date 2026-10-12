@@ -7,6 +7,8 @@ import type {
     IcePayload,
 } from "../types";
 
+// In dev, Vite proxies /socket.io → localhost:3000 (see vite.config.ts).
+// In prod, the client talks directly to the Render-hosted signaling server.
 const SIGNAL_URL =
     import.meta.env.VITE_SIGNAL_URL ??
     (import.meta.env.PROD
@@ -15,8 +17,10 @@ const SIGNAL_URL =
 
 const ICE_CONFIG: RTCConfiguration = {
     iceServers: [
+        // Public STUN servers (fast path when direct connection works)
         { urls: "stun:stun.l.google.com:19302" },
         { urls: "stun:stun.relay.metered.ca:80" },
+        // Metered.ca TURN relay (fallback for CGNAT / strict NAT)
         {
             urls: "turn:global.relay.metered.ca:80",
             username: "37c57fb8f7f7b17037d93382",
@@ -54,6 +58,8 @@ export function useCall(myId: string | null) {
     const [muted, setMuted] = useState(false);
     const [camOff, setCamOff] = useState(false);
     const [incoming, setIncoming] = useState<IncomingCall | null>(null);
+    const [callStartedAt, setCallStartedAt] = useState<number | null>(null);
+    const [durationSeconds, setDurationSeconds] = useState(0);
 
     // ---------- Cleanup ----------
     const cleanup = useCallback(() => {
@@ -78,6 +84,8 @@ export function useCall(myId: string | null) {
         setIncoming(null);
         setMuted(false);
         setCamOff(false);
+        setCallStartedAt(null);
+        setDurationSeconds(0);
         setState("idle");
     }, []);
 
@@ -221,6 +229,9 @@ export function useCall(myId: string | null) {
 
             pc.onconnectionstatechange = () => {
                 console.log("[Kaleo] connection state:", pc.connectionState);
+                if (pc.connectionState === "connected") {
+                    setCallStartedAt((prev) => prev ?? Date.now());
+                }
                 if (
                     ["failed", "disconnected", "closed"].includes(pc.connectionState)
                 ) {
@@ -232,6 +243,7 @@ export function useCall(myId: string | null) {
                 console.log("[Kaleo] ICE state:", pc.iceConnectionState);
             };
 
+            // Prefer AV1 / VP9 for data savings (only matters if video)
             const caps = RTCRtpSender.getCapabilities("video");
             if (caps) {
                 const efficient = caps.codecs.filter((c) =>
@@ -340,7 +352,7 @@ export function useCall(myId: string | null) {
         cleanup();
     }, [cleanup]);
 
-    // ---------- Data saver ----------
+    // ---------- Data saver: pause outgoing video when tab hidden ----------
     useEffect(() => {
         const onVis = () => {
             localStreamRef.current?.getVideoTracks().forEach((t) => {
@@ -351,6 +363,15 @@ export function useCall(myId: string | null) {
         return () => document.removeEventListener("visibilitychange", onVis);
     }, []);
 
+    // ---------- Call duration timer ----------
+    useEffect(() => {
+        if (!callStartedAt) return;
+        const id = setInterval(() => {
+            setDurationSeconds(Math.floor((Date.now() - callStartedAt) / 1000));
+        }, 1000);
+        return () => clearInterval(id);
+    }, [callStartedAt]);
+
     return {
         state,
         localStream,
@@ -358,6 +379,7 @@ export function useCall(myId: string | null) {
         muted,
         camOff,
         incoming,
+        durationSeconds,
         startCall,
         acceptCall,
         declineCall,
